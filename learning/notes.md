@@ -206,3 +206,259 @@ To read a message, first read the 4-byte integer, then read the payload.
 However, read/write can return less than the requested number of bytes under normal conditions. Will be explained later
 
 
+To actually read/write n butes from/to a TCP socket. You must do it in a loop.
+
+*This is the code from the website (me lazy)*
+
+static int32_t read_full(int fd, char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error, or unexpected EOF
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+static int32_t write_all(int fd, const char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+
+Whatever a read returns is accumulated in a buffer. It's how much data you have that matters, how much a single read returns matters not.
+
+#### Producing the Response
+
+*In the server program, reaed__full and write_all are used instead of read and write.*
+
+const size_t k_max_msg = 4096;
+
+static int32_t one_request(int connfd) {
+    // 4 bytes header
+    char rbuf[4 + k_max_msg];
+    errno = 0;
+    int32_t err = read_full(connfd, rbuf, 4);
+    if (err) {
+        msg(errno == 0 ? "EOF" : "read() error");
+        return err;
+    }
+    uint32_t len = 0;
+    memcpy(&len, rbuf, 4);  // assume little endian
+    if (len > k_max_msg) {
+        msg("too long");
+        return -1;
+    }
+    // request body
+    err = read_full(connfd, &rbuf[4], len);
+    if (err) {
+        msg("read() error");
+        return err;
+    }
+    // do something
+    printf("client says: %.*s\n", len, &rbuf[4]);
+    // reply using the same protocol
+    const char reply[] = "world";
+    char wbuf[4 + sizeof(reply)];
+    len = (uint32_t)strlen(reply);
+    memcpy(wbuf, &len, 4);
+    memcpy(&wbuf[4], reply, len);
+    return write_all(connfd, wbuf, 4 + len);
+}
+
+errno is set to the error code if the syscal failed. However, errno is NOT set to 0 if the syscall succeeded; it simply keeps the previous value. That's why the above code sets errno = 0 before read_full() to distinguish th eEOF case.
+
+You can read errno if and only if the call faield. But some libv fucntions have no way to tell if the call failed other than by clearing errno first. *Not Used in the Linux Kernel*
+
+
+#### Understanding read/write
+
+**TCP Socket vs Disk File**
+
+There are differences between reading disk files and reading sockets despite of sharing the same read/write API. When reading a disk file and it returns less than requested, it means ether EOF or an error. But a socket can return less data even under normal conditions. This can be explained by pull-based IO and push-based IO.
+
+Data over a network is pushed by the remote peer. The remote does not need the read call before sending data. The kernel will allocate a receive buffer to store the received data. Read just copies whatever is available from the receive buffer to the userspace buffer, since it's unknown if there is more inflight data.
+
+Data from a local file is pulled from disk. The data is always considered "ready" and the file size is known. There is no reason to return less than requested unless it's EOF.
+
+**Interrupted Syscalls**
+
+Normally, write just appends data to a kernel-side buffer, however the actual network transfer is deferred to the OS. The buffer size is limited, The buffer size is limited, so when the buffer is full, the caller must wait for it to drain before copying the remaining data. During the wait, the syscall may be interrupted by a signal, causing write to return partial written data.
+
+read can also be interrupted by a signal because it must wait if the buffer is empty. In this case, 0 bytes are read, but the return value is -1 an derrno is EINTR. This is not an error. An exercise for the reader: handle this case in read_full. (IDK how to do that)
+
+#### More on Protols
+
+**Text vs Binary**
+
+Why not use something simpler like HTTP and JSON? Plain text seems simple because it's human readable. But they aren't very machine-readable due to the implementation complexity
+
+A human-readable protocol deals with strings, strings are variable leength, so you are constantly checking the length of things, which is tedious and error-prone. While a binary protocol avoids unnecessary strings,, nothing is simpler than memcpy-ing a struct.
+
+**Length prefixes vs delimiters**
+
+Patterns this chapter:
+- Start with a fixed-size part
+- Variable-length data follows, with the length indicated by the fixed-size part
+
+When parsing a protocol like this, you always know how much data to read
+
+The other pattern is to use delimiters to indicate the end of the variable-length thing. To parse a delimiter protocol, keep reading until the delimiter is found. But what if the payload contains the delimiter? You now need escape sequences, which adds even more complexity. 
+
+**Case Study: Real World Protocols**
+
+HTTP headers are stirngs delimited by \r\n, each header is a KV pair delimited by colon. The URL may contain \r\n, so the URL in the request line must be escaped/encoded. You might forget that \r\n is not allowed in header values, which has caused some security vulnerabilities
+
+EX:
+
+GET /index.html HTTP/1.1 '\r\n\' --> end this line start a new one
+Host: example.com
+Foo: bar
+
+
+## Concurrent IO Models
+
+### Thread Based Concurrency
+
+A connnection-oriented request-response protocol can be used for any number of request-response pairs, and the client can hold the connection as long as it wants. So there is a need to handle multiple connections simultaneously, because while the server is waiting on one client, it cannot do anything with the other clients. THis is solved by multi-threading
+
+```python
+fd = socket()
+bind(fd, address)
+listen(fd)
+while True:
+    conn_fd = accpet(fd);
+    new_thread(do_something_with, conn_fd);
+
+def do_something_with(conn_fd):
+    while not_quitting(conn_fd):
+        req = read_request(conn_fd);
+        res = process(req);
+        write_response(conn_fd, res);
+    
+    close(conn_fd);
+```
+
+Most modern server apps use event loops to handle concurrent IO without creating new threads.
+
+Drawbacks of thread-based IO?
+- Memory Usage: Many threads means many stacks. Stacks are used for local variables and function calls, memory usage per thread is hard to control
+- Overhead: Stateless clients like PHP apps will create many short-lived connections, adding overhead to both latency and CPU usage
+
+Forking new processes costs even more.
+
+Multithreading and multiprocessing are still used when ther eis no need to scale to large numbers of connections, and they have a big advantage over event loops: they are easier and less error-prone.
+
+### Event Based Concurrency
+
+Concurrent IO is possible without threading. Let's start by examining the read() sysccall. The Linux TCP stack handles sending and receivin IP packets transparently, placing incoming data in a per-socket kernel-side buffer. read() merely copies data from the kernel-side buffer, and when the buffer is empty, read() suspends the calling thread until more data is ready.
+
+Similarly, write() does not interact directly with the network; it merely put the data into to kernel-side buffer for the TCP stack to consume, and when the buffer is full, write() suspends the calling thread until there is room.
+
+The need for multi-threading comes from the need to wait for each socket to become ready (to read or write). If there is a way to wait for multiple sockets at once, and then read/write whichever ones are ready, only a signle thread is needed.
+
+Ex:
+while running:
+    want_read = [...] # socket fds
+    want_write = [...] # socket fds
+    can_read, can_write = wait_for_readiness(want_read, want_write) # blocks
+    for fd in can_read:
+        data = read_nb(fd) # non-blocking, only consume from buffer 
+        handle_data(fd, data) # application logic without IO
+    for fd in can_write:
+        data = pending_data(fd) # produced by the application
+        n = write_nb(fd, data) # non-blocking, only append to the buffer
+        data_written(fd, n) # n <= len(data), limited by the available space
+
+This involves 3 operating system mechanisms:
+- Readiness notification: Wait for multiple sockets, reutrn when one or more are ready. "Ready"
+- Non-blocking read: Assuming the read buffer is not empty, consume from it
+- Non-blocking write: Assuming the write buffer is not full, put some data into it
+
+This is called event loop. Each loop iteration waits for any readiness events, the reacts to events without blocking, so that all sockets are processed without delay.
+
+
+Callbacks are common in JS. To read from something in JS, first register a callback on some event, then the data is delivered to the callback. This is what we will do next. Except in JS, the event loop is hidden, while in this project, the event loop is coded. 
+
+### Non-blocking IO
+
+If the read buffer is not empty, both blocking and non blocking reads will return the data immediately. Otherwise, a non-blocking read will return with errno = EAGAIN, while a blocking read will wait for more data. Non-blocking reads can be called repeatedly to fully drain the read buffer.
+
+If the write buffer is not full, both blocking and non-blocking writes will fill the write buffrer and return immediately. Otherwise, a non-blocking write will return with errno = EAGAIN, while a blocking write will wait or more room. Non-blocking writes can be called repeatedly to fully fill the write buffer. If the data is larget than the available write buffer, a non-blocking write will do a partial wite, while a blocking write may block.
+
+accept() is similar to read() in that it just consumes an item from a queue, so it has a non blocking mode and can provide readiness notifications
+
+ex: 
+for fd in can\_read:
+    if fd is a listening socket:
+        conn\_fd = accept\_nb(fd)
+        handle-new-conn(conn\_fd)
+
+    else:
+        
+        data = read-nb(fd)
+        handle-data(fd, data)
+
+
+Non blocking reads and writes us ethe same syscalls as blocking reads and writes. The 0-NoneBlock flag puts a socket in non-blocking mode
+
+ex:
+static void fd-set-nonblock(int fd){ 
+    int flags = fcntl(fd, F-GetFL, 0); // Get Flags
+    flags |= 0-NOnblock; // Modify Flags
+    fcntl(fd, f-setfl, flags); // Set Flags
+    // Handle errno
+}
+
+### Readiness API
+
+Waiting for IO readiness is platform specific, and there are several ones on Linux
+
+ex: can-read, can-write = wait-for-readiness(want-read, want-write)
+
+simplest one == poll()
+
+int poll(struct pollfd \* fds, nfds\_t nfds, int timeout);
+
+struct pollfd {
+    int fd;
+    short events;   // request: want to read, write, or both?
+    short revents;  // returned: can read? can write?
+}
+
+poll() takes an array of fds, each with an input flag and an output flag:
+- The events flag indicates whether you want to read (POLLIN), write (POLLOUT), or both (POLLIN|POLLOUT)
+- The revents flag returned from the syscall indicates the readiness
+
+The timeout arg is used to implement timers later
+
+#### Other Readiness APIs
+- select() -- can only used 1024 fds, not suggested
+- epoll\_wait() -- Linux specific, fd not pass in args, but stored in kernel (used to modify fd list) -- more scalable than poll() -- Default choice on linux
+- kqueue() is BSD specific. like epoll() but requires fewer syscalls because it can batch update the list
+
+All readiness APIs can only be used with sockets, pipes, and some special stuff like signalfd. THey cannot be used with disk files because when a socket is ready to read, it means that the data is in the read buffer, so the read is guaranteed not to block, but for a disk file, no such buffer exists in the kernel, so the readiness for a disk file is undefined.
+
+These API;s will always report a disk file as ready, but the IO will block. So file IO must be done outside thevent loop, in a thread pool.
+
+### Summary Of Concurrent IO Techniques
+
+Socket -- Thread per connection -- pthread -- low scalability
+Socket -- Process per connection -- fork() -- low scalability
+Socket -- Event loop -- poll(),epoll() -- high scalability
+File -- Thread pool -- pthread
+Any -- Event loop -- io\_uring -- high scalability
+
+
+
