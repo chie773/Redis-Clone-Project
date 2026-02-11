@@ -867,3 +867,37 @@ static void handle_write(Conn *conn) {
 ```
 
 This is not universally true. For example, some proxies and messaging protocols are not request-response and can read and write simulteaneously
+
+## Event Loop (Part 2)
+
+### Event Loop Basics
+
+- Callback-based programming: Reacting to events instead of blocking the thread
+- Handling input with non-blocking IO: Keep data in a buffer until there is enough to proceed
+- The boundary between the event loop and application code. A minimal event loop is still non-trivial, separate generic event handling from application logic
+- Persist application state between loop iterations. For request-response protocols, alternate between 2 states (read and write).
+
+***Bare Minimum***
+
+
+### Pipelined Requests
+
+**Batching requests without changing the protocol**
+
+A typical Redis server can handle 20K-200K requests/second for simle operations like get, set, del. Many other req-res applications are in the same range. This is limited by the number of IO events a single thread can handle if the application logic (processing requests) is insignificant.
+
+The server is bottlenecked by single-threaded IO, so it's desirable to increase the amount of work per IO by batching multiple requests per read.
+
+This can be done by pipelining requests. Normally a client sends 1 request, then waits for 1 response, a pipelined client sends n requests, then waits for n responses. The server still handles each request in order, the only difference is that it can get multiple requests in 1 read, effectively reducing the number of IOs.
+
+Requests pipelining also reduces latency on the client side because it can get multipe responses in 1 RTT (round trip time). This is a documented use case for Redis.
+
+**Problems caused by pipelined requests**
+
+Pipelining doese not change the protocol or server-side handling; requests are sent in order, the server handles them in order, then sends responses in order. So it should just work? Not so simple.
+
+Remember that TCP is just a stream of ordered bytes; a server simply consuming messages from it one at a time cannot tell the difference. but implementations often make extra assumptions. For example:
+
+```python
+print("go mess around with the server + client files before continuing so yuou understand better")
+```
