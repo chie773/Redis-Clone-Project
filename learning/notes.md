@@ -901,3 +901,26 @@ Remember that TCP is just a stream of ordered bytes; a server simply consuming m
 ```python
 print("go mess around with the server + client files before continuing so yuou understand better")
 ```
+
+## Key - Value Server
+
+A redis request is a lsit of strings, just like a linux command. Representing a list as a chunk of bytes is the task of (de)serialization. 
+
+nstr|len|str1|len|str2|...|len|str
+
+nstr is the number of items in the lists, followed by each item. Each string item is again prefixed with its length. It may be tempting to just concatenate null-terminated strings or delmiti them with spaces, but a delmited format will only cause problems, because the data may contain the delimiter
+
+Responses are integer status codes and another string
+
+### Handling Requests
+
+- Parse the command
+    - Create a program that can parse through the preassigned length of the string in memory, error checking for if input array is valid as well as making sure there aren't any leftover data after parsing is finished
+- Process the command and generate a response
+    - Define a response type and use an STL map to create the KV store (there are very specific requirements for production grade KV stores
+- Append the response to the output buffer
+    - Send response to the output buffer with its response code and its response length.
+
+
+
+
